@@ -1,0 +1,17 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Editor / IDE
+*.suo
+*.user
+.idea/
+
+# Logs
+*.log
+
+# Local dev server output
+*.pid
