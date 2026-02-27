@@ -141,6 +141,16 @@ export class NetworkManager {
         this._socket?.emit('ready');
     }
 
+    /**
+     * Notify the server that the game ended (for logging).
+     * @param {string} winnerId
+     * @param {string} loserId
+     * @param {number} ticks
+     */
+    sendGameOver(winnerId, loserId, ticks) {
+        this._socket?.emit('game_over', { winnerId, loserId, ticks });
+    }
+
     // =========================================================================
     //  Input relay (hot path)
     // =========================================================================

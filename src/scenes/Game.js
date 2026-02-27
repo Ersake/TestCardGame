@@ -562,10 +562,16 @@ export class Game extends Phaser.Scene {
         for (const sprite of this._projSprites.values()) sprite.destroy();
         this._projSprites.clear();
 
-        // Disconnect network if in online mode
+        // Report result to relay server for logging, then disconnect
         if (this._net) {
-            this._net.disconnect();
-            this._net = null;
+            const players = Object.values(this.gameState.players);
+            const loser   = players.find(p => p.hp <= 0);
+            const winner  = players.find(p => p.hp > 0);
+            if (loser && winner) {
+                this._net.sendGameOver(winner.id, loser.id, this.gameState.tick);
+            }
+            // Small delay so the packet can flush before the socket closes
+            setTimeout(() => { this._net?.disconnect(); this._net = null; }, 200);
         }
 
         this.time.delayedCall(600, () => {

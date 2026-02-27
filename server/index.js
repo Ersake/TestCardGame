@@ -57,6 +57,7 @@ function removePlayerFromRoom(room, socket) {
     room.players = room.players.filter(p => p.socket !== socket);
     if (room.players.length === 0) {
         rooms.delete(room.code);
+        console.log(`[Room ${room.code}] Room closed (empty). Active rooms: ${rooms.size}`);
     }
 }
 
@@ -87,7 +88,7 @@ io.on('connection', (socket) => {
         rooms.set(code, room);
         socket.join(code);
 
-        console.log(`[Room] ${socket.id} created room ${code}`);
+        console.log(`[Room ${code}] Created by ${socket.id}. Active rooms: ${rooms.size}`);
         if (typeof ack === 'function') {
             ack({ ok: true, code, playerId: 'p1' });
         }
@@ -114,7 +115,7 @@ io.on('connection', (socket) => {
         room.players.push({ socket, id: 'p2', ready: false });
         socket.join(code);
 
-        console.log(`[Room] ${socket.id} joined room ${code}`);
+        console.log(`[Room ${code}] ${socket.id} joined as p2. Players: 2/2`);
 
         // Notify the creator that an opponent joined
         const creator = room.players.find(p => p.id === 'p1');
@@ -152,7 +153,13 @@ io.on('connection', (socket) => {
             }
         }
     });
-
+    // ── Game over (logging only) ──────────────────────────────────────────────
+    socket.on('game_over', (data) => {
+        const found = findRoomBySocket(socket);
+        const code = found?.room?.code ?? '?';
+        const { winnerId, loserId, ticks } = data ?? {};
+        console.log(`[Room ${code}] Game over after ${ticks} ticks — winner: ${winnerId}, loser: ${loserId}`);
+    });
     // ── Input relay (hot path) ─────────────────────────────────────────────
     socket.on('input', (data) => {
         const found = findRoomBySocket(socket);
@@ -172,11 +179,14 @@ io.on('connection', (socket) => {
     });
 
     // ── Disconnect ─────────────────────────────────────────────────────────
-    socket.on('disconnect', () => {
-        console.log(`[Disconnect] ${socket.id}`);
+    socket.on('disconnect', (reason) => {
         const found = findRoomBySocket(socket);
-        if (!found) return;
+        if (!found) {
+            console.log(`[Disconnect] ${socket.id} (no room) — ${reason}`);
+            return;
+        }
         const { room, player } = found;
+        console.log(`[Room ${room.code}] ${player.id} (${socket.id}) disconnected — ${reason}. Remaining players: ${room.players.length - 1}`);
 
         // Notify opponent
         const opp = getOpponent(room, player.id);
