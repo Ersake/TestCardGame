@@ -1,475 +1,575 @@
 /**
- * Game.js — Main gameplay scene.
+ * Game.js — Real-time gameplay scene.
  *
- * Layout (1280×720):
- *   y  0–420   4×4 enemy grid (pseudo-3D perspective)
- *   y 420–480  feedback strip
- *   y 480–720  player hand + HUD
+ * Arena layout (1280×720):
+ *   Shared 4×8 grid with pseudo-3D perspective (far = small/top, near = large/bottom).
  *
- * Grid coordinates:
- *   grid[row][col]  row 0 = back row (small, top of screen)
- *                   row 3 = front row (large, near bottom of grid area)
+ *   Rows 0–3  enemy / P2 zone  (top of screen, small cells — far from camera)
+ *   Rows 4–7  P1 zone          (bottom of screen, large cells — near camera)
  *
- * Turn structure:
- *   Player phase → play any cards → End Turn
- *   Enemy phase  → melee advance → enemies attack → new enemies spawn → player draws
+ *   y   0–620  grid area (row 0 at y≈30, row 7 at y≈615)
+ *   y 630–640  feedback strip
+ *   y 640–720  card slot HUD
+ *
+ * Fixed timestep: 60 Hz simulation, variable render with alpha interpolation.
+ *
+ * Modes:
+ *   solo   — single player vs NPCs, no networking
+ *   online — two players via rollback netcode + relay server
+ *
+ * Controls:
+ *   W/A/S/D  — move player
+ *   1–5      — cast card in that slot
  */
 
-import { buildStarterDeck }  from '../data/CardData.js';
-import { Deck }              from '../systems/Deck.js';
-import { EnemyManager }      from '../systems/EnemyManager.js';
-import { Combat }            from '../systems/Combat.js';
+import { GameState, TICK_MS, HAND_SLOTS } from '../systems/GameState.js';
+import { InputBuffer }                    from '../systems/InputBuffer.js';
+import { RollbackManager }                from '../systems/RollbackManager.js';
+import { getCard }                        from '../data/CardData.js';
+import { GRID_ROWS, GRID_COLS }           from '../systems/EnemyManager.js';
 
-// ─── Grid geometry constants ───────────────────────────────────────────────
+// ─── Grid geometry ────────────────────────────────────────────────────────────
 
-const ROWS          = 4;
-const COLS          = 4;
 const GRID_CENTER_X = 640;
-const BASE_SPACING  = 190;   // horizontal center-to-center spacing at scale 1
-const BASE_CELL_W   = 155;   // cell width at scale 1
-const BASE_CELL_H   = 78;    // cell height at scale 1
+const GRID_Y_TOP    = 30;    // row 0 centre y
+const GRID_Y_BOTTOM = 615;   // row 7 centre y
+const BASE_SPACING  = 190;   // horizontal centre-to-centre at scale 1.0
+const BASE_CELL_W   = 155;
+const BASE_CELL_H   = 78;
 
-/** 0 = back row, 1 = front row (normalised depth) */
-function rowT(r)    { return r / (ROWS - 1); }
-function rowScale(r){ return 0.28 + 0.72 * rowT(r); }
-function rowY(r)    { return 72  + 330  * rowT(r); }   // 72 (back) → 402 (front)
-function cellX(r, c){ return GRID_CENTER_X + (c - 1.5) * BASE_SPACING * rowScale(r); }
-function cellW(r)   { return BASE_CELL_W * rowScale(r); }
-function cellH(r)   { return BASE_CELL_H * rowScale(r); }
+function rowT(r)     { return r / (GRID_ROWS - 1); }
+function rowScale(r) { return 0.15 + 0.85 * rowT(r); }
+function rowY(r)     { return GRID_Y_TOP + (GRID_Y_BOTTOM - GRID_Y_TOP) * rowT(r); }
+function cellX(r, c) { return GRID_CENTER_X + (c - 1.5) * BASE_SPACING * rowScale(r); }
+function cellW(r)    { return BASE_CELL_W * rowScale(r); }
+function cellH(r)    { return BASE_CELL_H * rowScale(r); }
 
-// ─── Hand layout constants ──────────────────────────────────────────────────
+/**
+ * Convert a simulation row to a display row.
+ * P1 sees the grid as-is (row 7 = bottom/near).
+ * P2 sees it rotated 180° (row 0 = bottom/near).
+ */
+function displayRow(r, flip) { return flip ? (GRID_ROWS - 1 - r) : r; }
 
-const HAND_SIZE    = 5;
-const CARD_W       = 155;
-const CARD_H       = 105;
-const CARD_Y       = 620;
-const CARD_SPACING = 190;
+/** Convert a simulation column to a display column (mirrored for 180° rotation). */
+function displayCol(c, flip) { return flip ? (GRID_COLS - 1 - c) : c; }
 
-// ─── Colours ────────────────────────────────────────────────────────────────
+/** Linear interpolate between two values. */
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// ─── Colours ─────────────────────────────────────────────────────────────────
 
 const COL = {
-    CELL_EMPTY_FILL   : 0x0d0d1a,
-    CELL_EMPTY_STROKE : 0x2a2a55,
-    CELL_MELEE_FILL   : 0x3a0a0a,
-    CELL_MELEE_STROKE : 0xaa3333,
-    CELL_RANGE_FILL   : 0x0a1a33,
-    CELL_RANGE_STROKE : 0x3366aa,
-    CELL_VALID_STROKE : 0x00ff88,
-    CARD_EMPTY_FILL   : 0x080810,
-    CARD_FILL         : 0x141428,
-    CARD_SEL_FILL     : 0x2a2a5a,
-    CARD_STROKE       : 0x4455aa,
-    CARD_SEL_STROKE   : 0xffff00,
-    BTN_ACTIVE_BG     : '#1a4a1a',
-    BTN_DISABLED_BG   : '#2a2a2a',
+    // Cells — enemy zone
+    ENEMY_EMPTY_FILL   : 0x0d0d1a,
+    ENEMY_EMPTY_STROKE : 0x2a2a55,
+    CELL_MELEE_FILL    : 0x3a0a0a,
+    CELL_MELEE_STROKE  : 0xaa3333,
+    CELL_RANGE_FILL    : 0x0a1a33,
+    CELL_RANGE_STROKE  : 0x3366aa,
+    // Cells — player zone
+    PLAYER_EMPTY_FILL  : 0x0a130a,
+    PLAYER_EMPTY_STROKE: 0x223322,
+    PLAYER_CELL_FILL   : 0x102010,
+    PLAYER_CELL_STROKE : 0x44aa44,
+    // Player sprite
+    PLAYER_FILL        : 0x44ff88,
+    PLAYER_STROKE      : 0xffffff,
+    // P2 sprite
+    P2_FILL            : 0x4488ff,
+    P2_STROKE          : 0xffffff,
+    // Projectiles
+    PROJ_PLAYER_FILL   : 0xffff44,
+    PROJ_ENEMY_FILL    : 0xff6622,
+    // Divider
+    DIVIDER            : 0x445566,
+    // Card slots
+    SLOT_FILL          : 0x141428,
+    SLOT_STROKE        : 0x4455aa,
+    SLOT_COOLDOWN_FILL : 0x0a0a1a,
 };
 
-// ───────────────────────────────────────────────────────────────────────────
+// ─── Card slot HUD layout ─────────────────────────────────────────────────────
+
+const SLOT_Y       = 680;
+const SLOT_W       = 155;
+const SLOT_H       = 70;
+const SLOT_SPACING = 195;
+
+// ─── Scene ───────────────────────────────────────────────────────────────────
 
 export class Game extends Phaser.Scene {
-
     constructor() { super('Game'); }
 
-    // ========================================================================
+    // =========================================================================
     //  create
-    // ========================================================================
-    create() {
-        // ── state ──────────────────────────────────────────────────────────
-        this.playerHp      = 10;
-        this.playerBlock   = 0;
-        this.turnCount     = 1;
-        this.phase         = 'player';   // 'player' | 'enemy'
-        this.selectedIdx   = -1;         // index into this.hand, or -1
-        this.targetingMode = false;
+    // =========================================================================
+    create(data) {
+        // ── mode config ────────────────────────────────────────────────────
+        this._mode          = data?.mode ?? 'solo';          // 'solo' | 'online'
+        this._localPlayerId = data?.localPlayerId ?? 'p1';
+        this._remotePlayerId = data?.remotePlayerId ?? null;
+        this._net           = data?.networkManager ?? null;   // NetworkManager instance (online only)
 
-        // ── systems ────────────────────────────────────────────────────────
-        this.deck          = new Deck(buildStarterDeck());
-        this.enemyManager  = new EnemyManager();
-        this.combat        = new Combat();
+        const seed      = data?.seed ?? (Date.now() >>> 0);
+        const playerIds = this._mode === 'online'
+            ? ['p1', 'p2']   // Always canonical order — determinism requires both clients create players identically
+            : ['p1'];
+
+        // ── simulation ─────────────────────────────────────────────────────
+        this.gameState    = new GameState({ seed, playerIds });
+        this.inputBuffer  = new InputBuffer();
+        this._accumulator = 0;
+
+        // ── rollback manager (online only) ─────────────────────────────────
+        this._rollback = null;
+        if (this._mode === 'online' && this._net) {
+            this._rollback = new RollbackManager(this.gameState, {
+                inputDelay:  2,
+                maxRollback: 15,
+                localId:     this._localPlayerId,
+                remoteId:    this._remotePlayerId,
+            });
+
+            // Wire incoming remote inputs to rollback manager
+            this._net.onRemoteInput(({ tick, data: inputData }) => {
+                this._rollback.addRemoteInput(tick, inputData);
+            });
+
+            this._net.onOpponentDisconnected(() => {
+                this._setFeedback('Opponent disconnected!');
+                // Give a moment then end
+                this.time.delayedCall(2000, () => this._onGameOver());
+            });
+        }
+
+        // ── view flip (P2 sees the grid upside-down so their zone is at bottom) ──
+        this._flipView = (this._localPlayerId === 'p2');
+
+        // ── keyboard ───────────────────────────────────────────────────────
+        this._setupKeys();
 
         // ── dark backdrop ──────────────────────────────────────────────────
         this.add.rectangle(640, 360, 1280, 720, 0x05050f);
 
-        // ── grid divider line ──────────────────────────────────────────────
-        const divider = this.add.graphics();
-        divider.lineStyle(1, 0x222244, 1);
-        divider.lineBetween(0, 430, 1280, 430);
+        // ── grid cells back-to-front (row 0 first so row 7 renders on top) ─
+        this._cellBgs    = [];
+        this._cellLabels = [];
 
-        // ── grid cells (back-to-front so front renders on top) ─────────────
-        this.cellBgs    = [];
-        this.cellLabels = [];
+        for (let r = 0; r < GRID_ROWS; r++) {
+            this._cellBgs[r]    = [];
+            this._cellLabels[r] = [];
 
-        for (let r = 0; r < ROWS; r++) {
-            this.cellBgs[r]    = [];
-            this.cellLabels[r] = [];
+            for (let c = 0; c < GRID_COLS; c++) {
+                const dr = displayRow(r, this._flipView);
+                const dc = displayCol(c, this._flipView);
+                const x  = cellX(dr, dc);
+                const y  = rowY(dr);
+                const w  = cellW(dr);
+                const h  = cellH(dr);
+                const fs = Math.max(7, Math.round(12 * rowScale(dr)));
 
-            for (let c = 0; c < COLS; c++) {
-                const x    = cellX(r, c);
-                const y    = rowY(r);
-                const w    = cellW(r);
-                const h    = cellH(r);
-                const fs   = Math.max(9, Math.round(13 * rowScale(r)));
+                // "Local zone" = the zone belonging to the local player
+                const isLocalZone = this._flipView ? (r <= 3) : (r >= 4);
+                const fillCol   = isLocalZone ? COL.PLAYER_EMPTY_FILL  : COL.ENEMY_EMPTY_FILL;
+                const strokeCol = isLocalZone ? COL.PLAYER_EMPTY_STROKE : COL.ENEMY_EMPTY_STROKE;
 
-                const bg = this.add.rectangle(x, y, w, h, COL.CELL_EMPTY_FILL)
-                    .setStrokeStyle(1, COL.CELL_EMPTY_STROKE)
-                    .setInteractive();
-                bg.input.cursor = 'pointer';
+                const bg = this.add.rectangle(x, y, w, h, fillCol)
+                    .setStrokeStyle(1, strokeCol);
 
                 const label = this.add.text(x, y, '', {
-                    fontSize : `${fs}px`,
-                    color    : '#dddddd',
-                    align    : 'center',
+                    fontSize  : `${fs}px`,
+                    color     : '#dddddd',
+                    align     : 'center',
                     lineSpacing: 2,
                 }).setOrigin(0.5);
 
-                bg.on('pointerdown', () => this.onCellClick(r, c));
-                bg.on('pointerover', () => {
-                    if (this.targetingMode && this._isValidTarget(r, c)) {
-                        bg.setFillStyle(bg.fillColor + 0x111111);
-                    }
-                });
-                bg.on('pointerout',  () => this.refreshCell(r, c));
-
-                this.cellBgs[r][c]    = bg;
-                this.cellLabels[r][c] = label;
+                this._cellBgs[r][c]    = bg;
+                this._cellLabels[r][c] = label;
             }
         }
 
-        // ── row distance labels (left gutter) ─────────────────────────────
-        const rowNames = ['Row 4 (back)', 'Row 3', 'Row 2', 'Row 1 (front)'];
-        for (let r = 0; r < ROWS; r++) {
-            this.add.text(14, rowY(r), rowNames[r], {
-                fontSize : `${Math.max(9, Math.round(10 * rowScale(r)))}px`,
-                color    : '#444466',
-            }).setOrigin(0, 0.5);
+        // ── zone divider between rows 3 and 4 ─────────────────────────────
+        const divR3 = displayRow(3, this._flipView);
+        const divR4 = displayRow(4, this._flipView);
+        const dividerY = Math.round((rowY(divR3) + rowY(divR4)) / 2);
+        this.add.line(640, dividerY, -640, 0, 640, 0, COL.DIVIDER).setLineWidth(1.5);
+        this.add.text(14, dividerY - 10, '── ARENA BOUNDARY ──', {
+            fontSize: '10px', color: '#445566',
+        });
+
+        // ── player sprite (placeholder rectangle) ─────────────────────────
+        this._playerSprite = this.add.rectangle(0, 0, 30, 40, COL.PLAYER_FILL)
+            .setStrokeStyle(2, COL.PLAYER_STROKE)
+            .setDepth(10);
+        this._playerLabel = this.add.text(0, 0, 'P1', {
+            fontSize: '10px', color: '#000000',
+        }).setOrigin(0.5).setDepth(11);
+
+        // ── P2 sprite (only in online mode) ────────────────────────────────
+        this._p2Sprite = null;
+        this._p2Label  = null;
+        if (this._mode === 'online') {
+            this._p2Sprite = this.add.rectangle(0, 0, 30, 40, COL.P2_FILL)
+                .setStrokeStyle(2, COL.P2_STROKE)
+                .setDepth(10);
+            this._p2Label = this.add.text(0, 0, 'P2', {
+                fontSize: '10px', color: '#000000',
+            }).setOrigin(0.5).setDepth(11);
         }
 
-        // ── hand card slots ────────────────────────────────────────────────
-        this.handBgs    = [];
-        this.handLabels = [];
+        // ── projectile pool ────────────────────────────────────────────────
+        this._projSprites = new Map();  // projectileId → Rectangle
 
-        for (let i = 0; i < HAND_SIZE; i++) {
-            const cx = 640 + (i - 2) * CARD_SPACING;
+        // ── feedback strip ─────────────────────────────────────────────────
+        this.add.rectangle(640, 635, 1280, 20, 0x000000, 0.7);
+        this._feedbackText = this.add.text(640, 635, '', {
+            fontSize: '13px', color: '#ffff99', align: 'center',
+        }).setOrigin(0.5);
 
-            const bg = this.add.rectangle(cx, CARD_Y, CARD_W, CARD_H, COL.CARD_EMPTY_FILL)
-                .setStrokeStyle(1, 0x222233)
-                .setInteractive();
-            bg.input.cursor = 'pointer';
+        // ── stats HUD ──────────────────────────────────────────────────────
+        this._hudText  = this.add.text(1260, 10, '', {
+            fontSize: '16px', color: '#ffffff', align: 'right',
+        }).setOrigin(1, 0).setDepth(20);
+        this._tickText = this.add.text(10, 10, '', {
+            fontSize: '13px', color: '#556677',
+        }).setDepth(20);
 
-            const label = this.add.text(cx, CARD_Y, '', {
-                fontSize  : '13px',
+        // ── card slot HUD ──────────────────────────────────────────────────
+        this._slots   = [];
+        const hotkeys = ['1', '2', '3', '4', '5'];
+        this.add.rectangle(640, SLOT_Y, 1280, SLOT_H + 20, 0x000000, 0.8);
+
+        for (let i = 0; i < HAND_SLOTS; i++) {
+            const cx = 640 + (i - 2) * SLOT_SPACING;
+
+            const bg = this.add.rectangle(cx, SLOT_Y, SLOT_W, SLOT_H, COL.SLOT_FILL)
+                .setStrokeStyle(1, COL.SLOT_STROKE);
+
+            const cooldownBar = this.add.rectangle(cx - SLOT_W / 2, SLOT_Y, 0, SLOT_H, 0x000000, 0.7)
+                .setOrigin(0, 0.5);
+
+            const label = this.add.text(cx, SLOT_Y, '', {
+                fontSize  : '12px',
                 color     : '#ccccff',
                 align     : 'center',
-                lineSpacing: 4,
-                wordWrap  : { width: CARD_W - 12 },
+                lineSpacing: 3,
+                wordWrap  : { width: SLOT_W - 10 },
             }).setOrigin(0.5);
 
-            bg.on('pointerdown', () => this.onCardClick(i));
-            bg.on('pointerover', () => {
-                if (this.hand[i] && this.phase === 'player') bg.setFillStyle(0x1e1e38);
-            });
-            bg.on('pointerout', () => {
-                if (this.hand[i]) {
-                    bg.setFillStyle(i === this.selectedIdx ? COL.CARD_SEL_FILL : COL.CARD_FILL);
-                }
-            });
+            const keyLabel = this.add.text(
+                cx - SLOT_W / 2 + 5, SLOT_Y - SLOT_H / 2 + 4,
+                hotkeys[i], { fontSize: '10px', color: '#888888' }
+            );
 
-            this.handBgs[i]    = bg;
-            this.handLabels[i] = label;
+            this._slots.push({ bg, cooldownBar, label, keyLabel });
         }
 
-        // ── HUD ────────────────────────────────────────────────────────────
-        this.hudText  = this.add.text(20,   450, '', { fontSize: '20px', color: '#ffffff' });
-        this.turnText = this.add.text(1260, 450, '', { fontSize: '20px', color: '#aaaacc', align: 'right' }).setOrigin(1, 0);
-
-        this.feedbackText = this.add.text(640, 480, '', {
-            fontSize : '15px',
-            color    : '#ffff99',
-            align    : 'center',
-        }).setOrigin(0.5, 0);
-
-        // ── End Turn button ────────────────────────────────────────────────
-        this.endTurnBtn = this.add.text(1180, 680, '  End Turn  ', {
-            fontSize        : '22px',
-            color           : '#ffffff',
-            backgroundColor : COL.BTN_ACTIVE_BG,
-            padding         : { x: 10, y: 8 },
-        }).setOrigin(0.5).setInteractive();
-        this.endTurnBtn.input.cursor = 'pointer';
-
-        this.endTurnBtn.on('pointerdown', () => this.endPlayerTurn());
-        this.endTurnBtn.on('pointerover', () => {
-            if (this.phase === 'player') this.endTurnBtn.setStyle({ color: '#aaffaa' });
-        });
-        this.endTurnBtn.on('pointerout', () => {
-            this.endTurnBtn.setStyle({ color: '#ffffff' });
-        });
-
-        // ── "Hand" label ───────────────────────────────────────────────────
-        this.add.text(20, 570, 'HAND', { fontSize: '12px', color: '#334466' });
-
-        // ── initial state ──────────────────────────────────────────────────
-        this.enemyManager.spawn(Phaser.Math.Between(1, 3));
-        this.hand = this._drawFive();
-        this.refreshAll();
+        // ── initial render ─────────────────────────────────────────────────
+        this._renderAll(0);
     }
 
-    // ========================================================================
-    //  Rendering helpers
-    // ========================================================================
+    // =========================================================================
+    //  update — fixed-timestep accumulator
+    // =========================================================================
+    update(_time, delta) {
+        this._readKeys();
 
-    refreshAll() {
-        this.refreshGrid();
-        this.refreshHand();
-        this.refreshHUD();
-    }
+        this._accumulator += delta;
 
-    refreshGrid() {
-        for (let r = 0; r < ROWS; r++) {
-            for (let c = 0; c < COLS; c++) {
-                this.refreshCell(r, c);
-            }
-        }
-        if (this.targetingMode) this.highlightValidTargets();
-    }
+        if (this._mode === 'online' && this._rollback) {
+            // ── Online: pump ticks through RollbackManager ───────────────
+            while (this._accumulator >= TICK_MS) {
+                // Gather local input and schedule it with delay
+                const localInput = this.inputBuffer.consume();
+                const scheduledTick = this._rollback.addLocalInput(localInput);
 
-    refreshCell(r, c) {
-        const enemy = this.enemyManager.grid[r][c];
-        const bg    = this.cellBgs[r][c];
-        const lbl   = this.cellLabels[r][c];
+                // Send input to remote player
+                this._net.sendInput(scheduledTick, localInput);
 
-        if (enemy) {
-            const isMelee = enemy.type === 'melee';
-            bg.setFillStyle(isMelee ? COL.CELL_MELEE_FILL : COL.CELL_RANGE_FILL)
-              .setStrokeStyle(1, isMelee ? COL.CELL_MELEE_STROKE : COL.CELL_RANGE_STROKE);
-            lbl.setText(`${isMelee ? '[M]' : '[R]'}\nHP ${enemy.hp}/${enemy.maxHp}`);
-        } else {
-            bg.setFillStyle(COL.CELL_EMPTY_FILL)
-              .setStrokeStyle(1, COL.CELL_EMPTY_STROKE);
-            lbl.setText('');
-        }
-    }
+                // Advance simulation (may stall if too far ahead)
+                const advanced = this._rollback.advanceTick();
+                if (!advanced) break;  // stalled — wait for remote
 
-    /** Returns true if cell (r,c) is a legal target for the currently selected card. */
-    _isValidTarget(r, c) {
-        if (this.selectedIdx < 0) return false;
-        const card  = this.hand[this.selectedIdx];
-        const enemy = this.enemyManager.grid[r][c];
-        if (!card || !enemy) return false;
-        if (card.targeting === 'single-melee')  return r === 3;
-        if (card.targeting === 'single-ranged') return r !== 3;
-        return false;
-    }
+                this._accumulator -= TICK_MS;
 
-    highlightValidTargets() {
-        for (let r = 0; r < ROWS; r++) {
-            for (let c = 0; c < COLS; c++) {
-                if (this._isValidTarget(r, c)) {
-                    this.cellBgs[r][c].setStrokeStyle(2, COL.CELL_VALID_STROKE);
-                }
-            }
-        }
-    }
-
-    refreshHand() {
-        for (let i = 0; i < HAND_SIZE; i++) {
-            const card = this.hand[i];
-            const bg   = this.handBgs[i];
-            const lbl  = this.handLabels[i];
-            const sel  = (i === this.selectedIdx);
-
-            if (card) {
-                bg.setAlpha(1)
-                  .setFillStyle(sel ? COL.CARD_SEL_FILL : COL.CARD_FILL)
-                  .setStrokeStyle(2, sel ? COL.CARD_SEL_STROKE : COL.CARD_STROKE);
-
-                const typeStr  = card.type === 'damage'
-                    ? `Atk ${card.value}`
-                    : `Blk +${card.value}`;
-                const targStr  = card.targeting.replace('single-', '').toUpperCase();
-                const clr      = card.type === 'damage' ? '#ff9999' : '#99ccff';
-
-                lbl.setText(`${card.name}\n${typeStr}\n${targStr}`)
-                   .setColor(clr);
-            } else {
-                bg.setAlpha(0.3)
-                  .setFillStyle(COL.CARD_EMPTY_FILL)
-                  .setStrokeStyle(1, 0x1a1a2a);
-                lbl.setText('');
-            }
-        }
-    }
-
-    refreshHUD() {
-        this.hudText.setText(`HP: ${this.playerHp}    Block: ${this.playerBlock}`);
-        this.turnText.setText(`Turn ${this.turnCount}`);
-        const active = this.phase === 'player';
-        this.endTurnBtn.setStyle({ backgroundColor: active ? COL.BTN_ACTIVE_BG : COL.BTN_DISABLED_BG });
-    }
-
-    setFeedback(msg, color = '#ffff99') {
-        this.feedbackText.setText(msg).setColor(color);
-        if (msg) {
-            if (this._feedbackTimer) this._feedbackTimer.remove();
-            this._feedbackTimer = this.time.delayedCall(2500, () => {
-                if (this.feedbackText) this.feedbackText.setText('');
-            });
-        }
-    }
-
-    // ========================================================================
-    //  Input handlers
-    // ========================================================================
-
-    onCardClick(index) {
-        if (this.phase !== 'player') return;
-        const card = this.hand[index];
-        if (!card) return;
-
-        // Clicking the already-selected card deselects it
-        if (this.selectedIdx === index) {
-            this.selectedIdx   = -1;
-            this.targetingMode = false;
-            this.setFeedback('');
-            this.refreshHand();
-            this.refreshGrid();
-            return;
-        }
-
-        this.selectedIdx = index;
-
-        if (card.targeting === 'aoe' || card.targeting === 'self') {
-            // No targeting step needed — play immediately
-            this.playSelectedCard(null);
-        } else {
-            // Enter targeting mode: highlight valid enemy cells
-            this.targetingMode = true;
-            this.refreshHand();
-            this.refreshGrid();   // also calls highlightValidTargets if targetingMode
-            this.setFeedback('Select a target enemy.');
-        }
-    }
-
-    onCellClick(row, col) {
-        if (this.phase !== 'player' || !this.targetingMode) return;
-        this.playSelectedCard({ row, col });
-    }
-
-    // ========================================================================
-    //  Card resolution
-    // ========================================================================
-
-    playSelectedCard(target) {
-        const card = this.hand[this.selectedIdx];
-        if (!card) return;
-
-        const result = this.combat.playCard(card, target, {
-            enemyManager: this.enemyManager,
-        });
-
-        if (!result.success) {
-            this.setFeedback(result.reason, '#ff7777');
-            return;
-        }
-
-        // Consume card from the hand slot
-        this.deck.discard([card]);
-        this.hand[this.selectedIdx] = null;
-
-        // Apply block locally (Combat returns success but doesn't mutate scene state)
-        if (card.targeting === 'self') {
-            this.playerBlock += card.value;
-        }
-
-        this.selectedIdx   = -1;
-        this.targetingMode = false;
-        this.setFeedback('');
-        this.refreshAll();
-    }
-
-    // ========================================================================
-    //  Turn transitions
-    // ========================================================================
-
-    endPlayerTurn() {
-        if (this.phase !== 'player') return;
-        this.phase = 'enemy';
-
-        // Discard any unplayed cards
-        const remaining = this.hand.filter(c => c !== null);
-        this.deck.discard(remaining);
-        this.hand      = Array(HAND_SIZE).fill(null);
-        this.selectedIdx   = -1;
-        this.targetingMode = false;
-
-        this.refreshAll();
-        this.runEnemyTurn();
-    }
-
-    runEnemyTurn() {
-        // Step 1 — melee enemies advance one row (400ms delay for visibility)
-        this.time.delayedCall(400, () => {
-            this.enemyManager.advanceMelee();
-            this.refreshGrid();
-
-            // Step 2 — enemies attack
-            this.time.delayedCall(500, () => {
-                const attackers   = this.enemyManager.getAttackers();
-                let   totalDmg    = 0;
-                for (const { enemy } of attackers) totalDmg += enemy.attack;
-
-                const absorbed = Math.min(this.playerBlock, totalDmg);
-                const hpDmg    = totalDmg - absorbed;
-                this.playerBlock = Math.max(0, this.playerBlock - absorbed);
-                this.playerHp   -= hpDmg;
-
-                if (totalDmg > 0) {
-                    this.setFeedback(
-                        `Enemies deal ${totalDmg} damage — ${absorbed} blocked, ${hpDmg} to HP.`,
-                        '#ff8888'
-                    );
-                } else {
-                    this.setFeedback('No enemies attacked this turn.', '#88ff88');
-                }
-                this.refreshHUD();
-
-                // Step 3 — check defeat
-                if (this.playerHp <= 0) {
-                    this.playerHp = 0;
-                    this.refreshHUD();
-                    this.time.delayedCall(900, () => {
-                        this.scene.start('GameOver', { turns: this.turnCount });
-                    });
+                if (this.gameState.over) {
+                    this._onGameOver();
                     return;
                 }
+            }
+        } else {
+            // ── Solo: direct simulation ──────────────────────────────────
+            while (this._accumulator >= TICK_MS) {
+                const input = { p1: this.inputBuffer.consume() };
+                this.gameState.simTick(input);
+                this._accumulator -= TICK_MS;
 
-                // Step 4 — spawn new enemies in the back row
-                this.time.delayedCall(500, () => {
-                    const count = Phaser.Math.Between(0, 4);
-                    this.enemyManager.spawn(count);
-                    this.refreshGrid();
+                if (this.gameState.over) {
+                    this._onGameOver();
+                    return;
+                }
+            }
+        }
 
-                    // Step 5 — begin next player turn
-                    this.time.delayedCall(350, () => {
-                        this.turnCount++;
-                        this.playerBlock = 0;   // block does not carry over
-                        this.phase       = 'player';
-                        this.hand        = this._drawFive();
-                        this.refreshAll();
-                        this.setFeedback(`Turn ${this.turnCount} — play your cards.`, '#aaccff');
-                    });
-                });
-            });
+        const alpha = this._accumulator / TICK_MS;
+        this._renderAll(alpha);
+    }
+
+    // =========================================================================
+    //  Input
+    // =========================================================================
+
+    _setupKeys() {
+        const kb = this.input.keyboard;
+
+        this._keys = {
+            w: kb.addKey(Phaser.Input.Keyboard.KeyCodes.W),
+            a: kb.addKey(Phaser.Input.Keyboard.KeyCodes.A),
+            s: kb.addKey(Phaser.Input.Keyboard.KeyCodes.S),
+            d: kb.addKey(Phaser.Input.Keyboard.KeyCodes.D),
+        };
+
+        const slotKeyCodes = [
+            Phaser.Input.Keyboard.KeyCodes.ONE,
+            Phaser.Input.Keyboard.KeyCodes.TWO,
+            Phaser.Input.Keyboard.KeyCodes.THREE,
+            Phaser.Input.Keyboard.KeyCodes.FOUR,
+            Phaser.Input.Keyboard.KeyCodes.FIVE,
+        ];
+        this._slotKeys = slotKeyCodes.map((code, i) => {
+            const key = kb.addKey(code);
+            key.on('down', () => this.inputBuffer.setCast(i));
+            return key;
         });
     }
 
-    // ========================================================================
-    //  Utility
-    // ========================================================================
+    _readKeys() {
+        const k = this._keys;
+        // When the view is flipped (P2), up/down are reversed so W always
+        // moves toward the top of the screen and S toward the bottom.
+        const up    = this._flipView ? 'down'  : 'up';
+        const down  = this._flipView ? 'up'    : 'down';
+        const left  = this._flipView ? 'right' : 'left';
+        const right = this._flipView ? 'left'  : 'right';
+        if      (Phaser.Input.Keyboard.JustDown(k.w)) this.inputBuffer.setMove(up);
+        else if (Phaser.Input.Keyboard.JustDown(k.s)) this.inputBuffer.setMove(down);
+        else if (Phaser.Input.Keyboard.JustDown(k.a)) this.inputBuffer.setMove(left);
+        else if (Phaser.Input.Keyboard.JustDown(k.d)) this.inputBuffer.setMove(right);
+    }
 
-    /** Draw 5 cards, padding with nulls if the deck runs low. */
-    _drawFive() {
-        const drawn = this.deck.drawHand(HAND_SIZE);
-        return Array.from({ length: HAND_SIZE }, (_, i) => drawn[i] ?? null);
+    // =========================================================================
+    //  Rendering
+    // =========================================================================
+
+    _renderAll(alpha) {
+        this._renderGrid();
+        this._renderPlayer(alpha);
+        this._renderProjectiles(alpha);
+        this._renderHUD();
+        this._renderSlots();
+    }
+
+    _renderGrid() {
+        const { enemyManager } = this.gameState;
+
+        for (let r = 0; r < GRID_ROWS; r++) {
+            const isLocalZone = this._flipView ? (r <= 3) : (r >= 4);
+
+            for (let c = 0; c < GRID_COLS; c++) {
+                const enemy = enemyManager.getAt(r, c);
+                const bg    = this._cellBgs[r][c];
+                const lbl   = this._cellLabels[r][c];
+
+                if (enemy) {
+                    const isMelee = enemy.type === 'melee';
+                    bg.setFillStyle(isMelee ? COL.CELL_MELEE_FILL : COL.CELL_RANGE_FILL)
+                      .setStrokeStyle(1, isMelee ? COL.CELL_MELEE_STROKE : COL.CELL_RANGE_STROKE);
+                    const hpBar = `${'█'.repeat(enemy.hp)}${'░'.repeat(enemy.maxHp - enemy.hp)}`;
+                    lbl.setText(`${isMelee ? 'M' : 'R'}\n${hpBar}`).setVisible(true);
+                } else {
+                    const fillCol   = isLocalZone ? COL.PLAYER_EMPTY_FILL  : COL.ENEMY_EMPTY_FILL;
+                    const strokeCol = isLocalZone ? COL.PLAYER_EMPTY_STROKE : COL.ENEMY_EMPTY_STROKE;
+                    bg.setFillStyle(fillCol).setStrokeStyle(1, strokeCol);
+                    lbl.setText('').setVisible(false);
+                }
+            }
+        }
+    }
+
+    /** Convert sim row to display row (rotated 180° for P2). */
+    _dr(r) { return displayRow(r, this._flipView); }
+    /** Convert sim col to display col (rotated 180° for P2). */
+    _dc(c) { return displayCol(c, this._flipView); }
+
+    _renderPlayer(alpha) {
+        // Render local player (P1 in solo, localPlayerId in online)
+        const localId = this._localPlayerId;
+        const p = this.gameState.players[localId];
+        if (!p) return;
+
+        const dprev = this._dr(p.prevRow);
+        const dcur  = this._dr(p.row);
+        const prevX = cellX(dprev, this._dc(p.prevCol));
+        const prevY = rowY(dprev);
+        const curX  = cellX(dcur, this._dc(p.col));
+        const curY  = rowY(dcur);
+
+        const x = lerp(prevX, curX, alpha);
+        const y = lerp(prevY, curY, alpha);
+        const s = lerp(rowScale(dprev), rowScale(dcur), alpha);
+
+        this._playerSprite.setPosition(x, y).setDisplaySize(34 * s, 44 * s);
+        this._playerLabel.setPosition(x, y).setFontSize(`${Math.round(10 * s)}px`);
+        this._playerLabel.setText(localId.toUpperCase());
+
+        // Highlight the player's current cell
+        this._cellBgs[p.row][p.col]
+            .setFillStyle(COL.PLAYER_CELL_FILL)
+            .setStrokeStyle(2, COL.PLAYER_CELL_STROKE);
+
+        // Render remote player (online only)
+        if (this._p2Sprite && this._remotePlayerId) {
+            const p2 = this.gameState.players[this._remotePlayerId];
+            if (!p2) return;
+
+            const dp2prev = this._dr(p2.prevRow);
+            const dp2cur  = this._dr(p2.row);
+            const p2prevX = cellX(dp2prev, this._dc(p2.prevCol));
+            const p2prevY = rowY(dp2prev);
+            const p2curX  = cellX(dp2cur, this._dc(p2.col));
+            const p2curY  = rowY(dp2cur);
+
+            const p2x = lerp(p2prevX, p2curX, alpha);
+            const p2y = lerp(p2prevY, p2curY, alpha);
+            const p2s = lerp(rowScale(dp2prev), rowScale(dp2cur), alpha);
+
+            this._p2Sprite.setPosition(p2x, p2y).setDisplaySize(34 * p2s, 44 * p2s);
+            this._p2Label.setPosition(p2x, p2y).setFontSize(`${Math.round(10 * p2s)}px`);
+            this._p2Label.setText(this._remotePlayerId.toUpperCase());
+
+            // Highlight remote player's cell
+            this._cellBgs[p2.row][p2.col]
+                .setFillStyle(0x0a1a30)
+                .setStrokeStyle(2, 0x4488ff);
+        }
+    }
+
+    _renderProjectiles(alpha) {
+        const activeIds = new Set();
+
+        for (const proj of this.gameState.combat.projectiles) {
+            activeIds.add(proj.id);
+
+            const dprev = this._dr(proj.prevRow);
+            const dcur  = this._dr(proj.row);
+            const prevX = cellX(dprev, this._dc(proj.prevCol));
+            const prevY = rowY(dprev);
+            const curX  = cellX(dcur, this._dc(proj.col));
+            const curY  = rowY(dcur);
+            const x     = lerp(prevX, curX, alpha);
+            const y     = lerp(prevY, curY, alpha);
+            const s     = lerp(rowScale(dprev), rowScale(dcur), alpha);
+            const size  = Math.max(6, 16 * s);
+            const color = proj.ownerType === 'player' ? COL.PROJ_PLAYER_FILL : COL.PROJ_ENEMY_FILL;
+
+            if (!this._projSprites.has(proj.id)) {
+                const sprite = this.add.rectangle(x, y, size, size, color).setDepth(8);
+                this._projSprites.set(proj.id, sprite);
+            } else {
+                this._projSprites.get(proj.id)
+                    .setPosition(x, y)
+                    .setDisplaySize(size, size)
+                    .setFillStyle(color);
+            }
+        }
+
+        // Clean up sprites whose projectiles no longer exist
+        for (const [id, sprite] of this._projSprites) {
+            if (!activeIds.has(id)) {
+                sprite.destroy();
+                this._projSprites.delete(id);
+            }
+        }
+    }
+
+    _renderHUD() {
+        const p = this.gameState.players[this._localPlayerId];
+        if (!p) return;
+        const hpBar  = `${'♥'.repeat(Math.max(0, p.hp))}${'♡'.repeat(Math.max(0, p.maxHp - p.hp))}`;
+        const blkStr = p.block > 0 ? `  Shield:${p.block}` : '';
+
+        let hudStr = `You: ${hpBar}${blkStr}`;
+
+        // Show opponent HP in online mode
+        if (this._remotePlayerId) {
+            const p2 = this.gameState.players[this._remotePlayerId];
+            if (p2) {
+                const p2hp = `${'♥'.repeat(Math.max(0, p2.hp))}${'♡'.repeat(Math.max(0, p2.maxHp - p2.hp))}`;
+                const p2blk = p2.block > 0 ? `  Shield:${p2.block}` : '';
+                hudStr += `\nOpp: ${p2hp}${p2blk}`;
+            }
+        }
+
+        this._hudText.setText(hudStr);
+
+        const tickStr = this._rollback
+            ? `t:${this._rollback.getCurrentTick()} rb:${this._rollback.stats.rollbacks}`
+            : `t:${this.gameState.tick}`;
+        this._tickText.setText(tickStr);
+    }
+
+    _renderSlots() {
+        const p = this.gameState.players[this._localPlayerId];
+        if (!p) return;
+
+        for (let i = 0; i < HAND_SLOTS; i++) {
+            const slot = p.slots[i];
+            const { bg, cooldownBar, label } = this._slots[i];
+
+            if (slot.cardId) {
+                const card    = getCard(slot.cardId);
+                const dmg     = card.projectiles.reduce((sum, t) => sum + t.damage, 0);
+                const typeStr = card.type === 'damage' ? `Atk ${dmg}` : `Blk +${card.blockValue}`;
+                bg.setFillStyle(COL.SLOT_FILL).setStrokeStyle(1, COL.SLOT_STROKE);
+                cooldownBar.setSize(0, SLOT_H);
+                label.setText(`${card.name}\n${typeStr}`).setColor('#ccccff');
+            } else {
+                // Show cooldown progress bar shrinking as timer counts down
+                const frac = slot.cooldownTimer > 0
+                    ? slot.cooldownTimer / 120   // normalise against max expected cooldown
+                    : 0;
+                bg.setFillStyle(COL.SLOT_COOLDOWN_FILL).setStrokeStyle(1, 0x222233);
+                cooldownBar.setSize(SLOT_W * frac, SLOT_H);
+                label.setText('').setColor('#555577');
+            }
+        }
+    }
+
+    // =========================================================================
+    //  Game over
+    // =========================================================================
+
+    _setFeedback(text) {
+        if (this._feedbackText) this._feedbackText.setText(text);
+    }
+
+    _onGameOver() {
+        // Stop the simulation loop from re-entering the online branch
+        this._rollback = null;
+
+        this.input.keyboard.removeAllKeys(true);
+        for (const sprite of this._projSprites.values()) sprite.destroy();
+        this._projSprites.clear();
+
+        // Disconnect network if in online mode
+        if (this._net) {
+            this._net.disconnect();
+            this._net = null;
+        }
+
+        this.time.delayedCall(600, () => {
+            this.scene.start('GameOver', { turns: this.gameState.tick });
+        });
     }
 }

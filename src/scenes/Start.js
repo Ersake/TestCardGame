@@ -22,7 +22,7 @@ export class Start extends Phaser.Scene {
             color    : '#7788bb',
         }).setOrigin(0.5);
 
-        const startBtn = this.add.text(640, 430, '  Start Game  ', {
+        const startBtn = this.add.text(640, 400, '  Solo Play  ', {
             fontSize        : '32px',
             color           : '#ffffff',
             backgroundColor : '#1a4a1a',
@@ -30,9 +30,21 @@ export class Start extends Phaser.Scene {
         }).setOrigin(0.5).setInteractive();
         startBtn.input.cursor = 'pointer';
 
-        startBtn.on('pointerdown', () => this.scene.start('Game'));
+        startBtn.on('pointerdown', () => this.scene.start('Game', { mode: 'solo' }));
         startBtn.on('pointerover', () => startBtn.setStyle({ color: '#aaffaa' }));
         startBtn.on('pointerout',  () => startBtn.setStyle({ color: '#ffffff' }));
+
+        const multiBtn = this.add.text(640, 480, '  Multiplayer  ', {
+            fontSize        : '32px',
+            color           : '#ffffff',
+            backgroundColor : '#1a1a4a',
+            padding         : { x: 20, y: 14 },
+        }).setOrigin(0.5).setInteractive();
+        multiBtn.input.cursor = 'pointer';
+
+        multiBtn.on('pointerdown', () => this.scene.start('Lobby'));
+        multiBtn.on('pointerover', () => multiBtn.setStyle({ color: '#aaaaff' }));
+        multiBtn.on('pointerout',  () => multiBtn.setStyle({ color: '#ffffff' }));
 
         this.add.text(640, 680, 'Play cards · Defeat enemies · Survive', {
             fontSize : '16px',

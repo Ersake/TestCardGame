@@ -43,6 +43,9 @@
     </head>
     <body>
         <div id="game-container"></div>
+        <!-- Relay server URL — change this to your deployed server for internet play -->
+        <script>window.RELAY_SERVER_URL = 'http://localhost:3000';</script>
+        <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
         <script src="./phaser.js"></script>
         <script type="module" src="./src/main.js"></script>
     </body>

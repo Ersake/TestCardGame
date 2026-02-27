@@ -2,6 +2,17 @@
 
 This file is the authoritative guide for AI coding agents working on this project. Read it in full before making any changes.
 
+## Context Discipline & Subagent Policy
+
+
+Subagents are the 
+**primary mechanism**
+ for complex work. Use them by default for:
+- Multi-file changes (≥3 files) or cross-surface edits (frontend + worker + data)
+- Research-heavy tasks (audits, schema analysis, migration planning)
+- Any step that might consume >20% of context budget
+Keep the main chat as an orchestration layer and spin up sub agents as needed.
+
 ---
 
 ## Project Overview
@@ -48,6 +59,12 @@ src/
   main.js           # Phaser game config + scene registry
   scenes/
     <SceneName>.js  # One file per scene, PascalCase filename
+  systems/          # Deterministic simulation + rollback
+  network/          # NetworkManager (Socket.io wrapper)
+  data/             # Card definitions, static config
+server/
+  index.js          # Node.js relay server (Socket.io)
+  package.json      # Server dependencies
 ```
 
 ### Scene rules
@@ -67,45 +84,68 @@ src/
 
 ## Current State
 
-The project has a working **core gameplay loop**. Three scenes are registered:
+The project is a **real-time card fighter** with rollback netcode multiplayer (Phase 3 of ROADMAP.md). Four scenes are registered:
 
 | Scene | File | Purpose |
 |---|---|---|
-| `Start` | `src/scenes/Start.js` | Title screen — launches `Game` |
-| `Game` | `src/scenes/Game.js` | Main gameplay: 4×4 enemy grid, card hand, turn loop |
+| `Start` | `src/scenes/Start.js` | Title screen — Solo Play or Multiplayer |
+| `Lobby` | `src/scenes/Lobby.js` | Room create/join, ready handshake, launches Game with network config |
+| `Game` | `src/scenes/Game.js` | Real-time gameplay: solo or online (rollback netcode), 4×8 grid, WASD + hotkeys |
 | `GameOver` | `src/scenes/GameOver.js` | Shown at 0 HP — restart or return to menu |
 
 ### Systems
 
 | Module | File | Responsibility |
 |---|---|---|
-| `CardData` | `src/data/CardData.js` | Card definitions + starter deck factory |
-| `Deck` | `src/systems/Deck.js` | Draw pile, discard pile, shuffle |
-| `EnemyManager` | `src/systems/EnemyManager.js` | 4×4 grid state, spawning, melee advance, attack resolution |
-| `Combat` | `src/systems/Combat.js` | Card-play resolution and validation |
+| `CardData` | `src/data/CardData.js` | Card definitions (with projectile templates) + starter deck factory |
+| `RNG` | `src/systems/RNG.js` | Seeded PRNG (mulberry32) — all simulation randomness goes here |
+| `Deck` | `src/systems/Deck.js` | Draw/discard pile using seeded RNG; stores card IDs; snapshotable |
+| `EnemyManager` | `src/systems/EnemyManager.js` | 4×8 grid, tick-based enemy AI, projectile spawn requests; snapshotable |
+| `Combat` | `src/systems/Combat.js` | Active projectile list, per-tick movement + hit detection; snapshotable |
+| `GameState` | `src/systems/GameState.js` | Master simulation state — orchestrates all systems per tick; snapshotable |
+| `InputBuffer` | `src/systems/InputBuffer.js` | Decouples keyboard events from simulation tick consumption |
+| `RollbackManager` | `src/systems/RollbackManager.js` | Rollback netcode engine: input delay, prediction, snapshot/restore, replay |
+
+### Networking
+
+| Module | File | Responsibility |
+|---|---|---|
+| `NetworkManager` | `src/network/NetworkManager.js` | Socket.io client wrapper — only file that touches networking |
+| Relay server | `server/index.js` | Thin Node.js relay: rooms, input forwarding, clock sync (no game logic) |
+
+**Multiplayer architecture**: Rollback netcode, 2-frame input delay, 15-frame max rollback, Socket.io WebSocket transport, thin relay server (no authoritative simulation). Both clients run identical deterministic simulations with seeded PRNG.
+
+### Arena
+
+- **4 columns × 8 rows** shared grid with pseudo-3D perspective
+- **Rows 0–3**: P2 / enemy territory (top of screen, small/far)
+- **Rows 4–7**: P1 territory (bottom of screen, large/near)
+- Enemies spawn in row 0 and advance toward row 7; reaching row 7 deals gate damage
+- P1 starts at row 6, col 1; P2 starts at row 1, col 2 — each confined to their half
+- Both players move with WASD
 
 ### Cards (current set)
 
-| Name | Targeting | Type | Value |
+| Name | Type | Projectiles | Cooldown |
 |---|---|---|---|
-| Strike | `single-melee` | damage | 6 — front row only |
-| Shoot | `single-ranged` | damage | 4 — rows 2–4 only |
-| Blast | `aoe` | damage | 2 — all enemies |
-| Defend | `self` | block | +5 block |
+| Strike | damage | 1× straight, 6 dmg, range 3 (short) | 90 ticks |
+| Shoot | damage | 1× straight, 4 dmg, range 8 (full grid) | 75 ticks |
+| Blast | damage | 3× spread (left/straight/right), 2 dmg each | 120 ticks |
+| Defend | block | none — grants +5 block instantly | 60 ticks |
 
-### Turn structure
+Cards are cast with hotkeys **1–5**. Each slot auto-refills from the deck after its cooldown expires.
 
-1. Player draws 5 cards
-2. Player plays any cards (click card → click target if needed)
-3. Player clicks **End Turn**
-4. Melee enemies advance one row toward the player
-5. All attackers deal damage (block absorbs first; block resets each turn)
-6. 0–4 new enemies spawn in the back row
-7. Repeat from step 1
+### Simulation structure
+
+- **Fixed timestep**: 60 Hz (`TICK_MS ≈ 16.667ms`). `update()` accumulates `delta` and calls `simTick()` in 16.667ms steps.
+- **Alpha interpolation**: leftover accumulator fraction is passed to the render functions for smooth sub-tick motion.
+- **Deterministic**: all randomness goes through the seeded `RNG` instance. Same seed + same inputs = identical outcome.
+- **Snapshotable**: every system implements `toSnapshot()` / `fromSnapshot()` — used by RollbackManager for rollback/replay.
+- **Rollback netcode**: in online mode, RollbackManager wraps the simulation. Local inputs are delayed by 2 frames; remote inputs predicted (last-input repeat). On misprediction, state rewinds to snapshot and replays forward.
 
 ### Art
 
-All visuals are **placeholder rectangles and text** — no sprite assets are used by the game scenes yet. The original `assets/` folder contents (`space.png`, `phaser.png`, `spaceship.png`) are unused and can be removed when real art is added.
+All visuals are **placeholder rectangles and text**. The original `assets/` folder contents are unused.
 
 ---
 
@@ -159,10 +199,46 @@ This project requires **no build step**. To verify changes:
 
 ---
 
+## Hosting
+
+### Client (static files)
+
+The game client is hosted on **GitHub Pages** — the entire repo root is served as static files. No build step required.
+
+### Relay server URL
+
+The relay server URL is configured in **`index.html`** via a script tag:
+
+```html
+<script>window.RELAY_SERVER_URL = 'http://localhost:3000';</script>
+```
+
+Change this to your deployed server URL (e.g. `https://testcardgame-relay.onrender.com`) and push to GitHub Pages to enable internet play. The Lobby scene reads `window.RELAY_SERVER_URL` at runtime.
+
+---
+
+## Server
+
+The relay server lives in `server/`:
+
+```
+server/
+  index.js        # Node.js + Socket.io thin relay server
+  package.json    # Dependencies (socket.io)
+  render.yaml     # Render.com deployment blueprint
+  node_modules/   # Installed packages (gitignored)
+```
+
+**Local**: `cd server && npm install && npm start` (listens on port 3000).
+
+**Production**: deploy the `server/` directory to any Node.js host (Render, Railway, Fly.io, etc.). The server reads `PORT` from the environment variable.
+
+The server does NOT run game logic. It manages rooms (4-char codes, max 2 players), relays input packets, handles the ready handshake, and provides clock sync.
+
+---
+
 ## Out of Scope (for now)
 
 - TypeScript
 - React, Vue, or any UI framework wrappers
-- Server-side code or networking
-- npm / node_modules
 - Any bundler or transpiler

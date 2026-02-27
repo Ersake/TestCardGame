@@ -1,123 +1,153 @@
 /**
- * EnemyManager.js — owns the 4×4 enemy grid and all mutation logic.
+ * EnemyManager.js — owns the 4×8 shared arena grid and all enemy mutation logic.
  *
  * Grid layout:
- *   grid[row][col]  row 0 = back (furthest from player)
- *                   row 3 = front (closest to player)
- *                   col 0-3 left to right
+ *   grid[row][col]  8 rows × 4 cols
+ *   row 0 = enemy back row (far from player, small on screen)
+ *   row 7 = player back row (closest to camera, large on screen)
+ *   col 0–3 left to right
+ *
+ * Zones:
+ *   rows 0–3  enemy territory  (enemies spawn here)
+ *   rows 4–7  player territory (player moves here)
+ *
+ * Enemies advance from row 0 toward higher row numbers (toward the player).
+ * Melee enemies move one row per actionInterval ticks.
+ * Ranged enemies never move; they fire projectiles toward the player.
  *
  * Enemy object shape:
- *   { type: 'melee'|'ranged', hp: number, maxHp: number, attack: number }
+ *   { type, hp, maxHp, attack, actionTimer, actionInterval }
  *
- * Melee enemies move one row forward per enemy turn and attack when in row 3.
- * Ranged enemies never move and always attack regardless of row.
+ * tick() returns a TickResult:
+ *   { projectiles: ProjectileRequest[], gateDamage: number }
+ *
+ * ProjectileRequest:
+ *   { row, col, dr, dc, damage, speed, range, ownerType: 'enemy' }
+ *
+ * gateDamage: total damage dealt by melee enemies that walked off row 7.
  */
 
+export const GRID_ROWS = 8;
+export const GRID_COLS = 4;
+export const ENEMY_ZONE_MAX_ROW = 3;  // enemies start in rows 0–3
+export const PLAYER_ZONE_MIN_ROW = 4;  // player lives in rows 4–7
+
 export class EnemyManager {
-    constructor() {
+    /**
+     * @param {RNG} rng  Seeded RNG instance shared with the simulation.
+     */
+    constructor(rng) {
+        this._rng  = rng;
         // grid[row][col]: enemy object or null
-        this.grid = Array.from({ length: 4 }, () => Array(4).fill(null));
+        this.grid  = Array.from({ length: GRID_ROWS }, () => Array(GRID_COLS).fill(null));
     }
 
-    // ------------------------------------------------------------------ spawn
+    // -------------------------------------------------------------------------
+    //  Spawn
+    // -------------------------------------------------------------------------
 
     /**
-     * Spawn up to `count` random enemies in empty cells on row 0 (back row).
+     * Attempt to spawn up to `count` enemies in empty cells on row 0.
      * @param {number} count
      */
     spawn(count) {
         const emptyCols = [];
-        for (let c = 0; c < 4; c++) {
+        for (let c = 0; c < GRID_COLS; c++) {
             if (!this.grid[0][c]) emptyCols.push(c);
         }
-        // Shuffle so the occupied columns are chosen randomly
-        for (let i = emptyCols.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [emptyCols[i], emptyCols[j]] = [emptyCols[j], emptyCols[i]];
-        }
+        this._rng.shuffle(emptyCols);
         const toSpawn = Math.min(count, emptyCols.length);
+
         for (let i = 0; i < toSpawn; i++) {
-            const col  = emptyCols[i];
-            const type = Math.random() < 0.5 ? 'melee' : 'ranged';
-            const hp   = type === 'melee'
-                ? 4 + Math.floor(Math.random() * 3)   // 4-6
-                : 3 + Math.floor(Math.random() * 3);   // 3-5
-            this.grid[0][col] = { type, hp, maxHp: hp, attack: type === 'melee' ? 4 : 3 };
+            const col      = emptyCols[i];
+            const isMelee  = this._rng.nextBool(0.5);
+            const type     = isMelee ? 'melee' : 'ranged';
+            const hp       = isMelee
+                ? this._rng.nextInt(4, 6)
+                : this._rng.nextInt(3, 5);
+            const interval = isMelee ? 90 : 80;  // ticks between actions
+
+            this.grid[0][col] = {
+                type,
+                hp,
+                maxHp:          hp,
+                attack:         isMelee ? 4 : 3,
+                actionTimer:    interval,
+                actionInterval: interval,
+            };
         }
     }
 
-    // --------------------------------------------------------------- movement
+    // -------------------------------------------------------------------------
+    //  Simulation tick
+    // -------------------------------------------------------------------------
 
     /**
-     * Move every melee enemy one row toward the player (row+1).
-     * If the target cell is occupied the enemy stays put.
-     * Processes back-to-front to avoid chain-reactions in one pass.
+     * Advance all enemy timers by one tick.  When a timer fires:
+     *   - Melee  : attempt to move one row toward the player.
+     *   - Ranged : emit a projectile request.
+     *
+     * Melee enemies that would step beyond row 7 deal gate damage instead.
+     *
+     * @returns {{ projectiles: object[], gateDamage: number }}
      */
-    advanceMelee() {
-        for (let r = 2; r >= 0; r--) {          // start at row 2; row 3 already at front
-            for (let c = 0; c < 4; c++) {
-                const enemy = this.grid[r][c];
-                if (enemy && enemy.type === 'melee' && !this.grid[r + 1][c]) {
-                    this.grid[r + 1][c] = enemy;
-                    this.grid[r][c]     = null;
-                }
-            }
-        }
-    }
+    tick() {
+        const projectiles = [];
+        let   gateDamage  = 0;
 
-    // -------------------------------------------------------------- attacking
-
-    /**
-     * Returns every enemy that attacks this turn:
-     *   - Ranged: any row
-     *   - Melee:  row 3 only
-     * @returns {{ row: number, col: number, enemy: object }[]}
-     */
-    getAttackers() {
-        const attackers = [];
-        for (let r = 0; r < 4; r++) {
-            for (let c = 0; c < 4; c++) {
+        // Process front-to-back so advancing melee enemies don't chain-push.
+        for (let r = GRID_ROWS - 1; r >= 0; r--) {
+            for (let c = 0; c < GRID_COLS; c++) {
                 const enemy = this.grid[r][c];
                 if (!enemy) continue;
-                if (enemy.type === 'ranged' || (enemy.type === 'melee' && r === 3)) {
-                    attackers.push({ row: r, col: c, enemy });
+
+                enemy.actionTimer--;
+                if (enemy.actionTimer > 0) continue;
+
+                enemy.actionTimer = enemy.actionInterval;  // reset
+
+                if (enemy.type === 'melee') {
+                    const nextRow = r + 1;
+                    if (nextRow >= GRID_ROWS) {
+                        // Reached the far edge — gate damage
+                        gateDamage     += enemy.attack;
+                        this.grid[r][c] = null;
+                    } else if (!this.grid[nextRow][c]) {
+                        // Advance
+                        this.grid[nextRow][c] = enemy;
+                        this.grid[r][c]       = null;
+                    }
+                    // If next cell occupied, enemy waits (stays in place)
+
+                } else {
+                    // Ranged — emit a projectile heading toward the player
+                    projectiles.push({
+                        row:       r,
+                        col:       c,
+                        dr:        +1,   // toward player (increasing row)
+                        dc:        0,
+                        damage:    enemy.attack,
+                        speed:     10,   // ticks per cell (moderate speed)
+                        range:     GRID_ROWS,
+                        ownerType: 'enemy',
+                    });
                 }
             }
         }
-        return attackers;
+
+        return { projectiles, gateDamage };
     }
 
-    // ---------------------------------------------------------------- queries
-
-    /** All living enemies in a specific row. */
-    getEnemiesInRow(row) {
-        const result = [];
-        for (let c = 0; c < 4; c++) {
-            if (this.grid[row][c]) result.push({ row, col: c, enemy: this.grid[row][c] });
-        }
-        return result;
-    }
-
-    /** All living enemies across the entire grid. */
-    getAllEnemies() {
-        const result = [];
-        for (let r = 0; r < 4; r++) {
-            for (let c = 0; c < 4; c++) {
-                if (this.grid[r][c]) result.push({ row: r, col: c, enemy: this.grid[r][c] });
-            }
-        }
-        return result;
-    }
-
-    // --------------------------------------------------------------- mutation
+    // -------------------------------------------------------------------------
+    //  Damage
+    // -------------------------------------------------------------------------
 
     /**
-     * Deal `amount` damage to the enemy at (row, col).
-     * Removes the enemy if HP reaches 0.
+     * Deal damage to the enemy at (row, col).  Removes it if HP drops to 0.
      * @param {number} row
      * @param {number} col
      * @param {number} amount
-     * @returns {boolean} true if the enemy died
+     * @returns {boolean}  true if the enemy was killed
      */
     damageEnemy(row, col, amount) {
         const enemy = this.grid[row][col];
@@ -128,5 +158,50 @@ export class EnemyManager {
             return true;
         }
         return false;
+    }
+
+    // -------------------------------------------------------------------------
+    //  Queries
+    // -------------------------------------------------------------------------
+
+    /**
+     * @returns {{ row: number, col: number, enemy: object }[]}
+     */
+    getAllEnemies() {
+        const result = [];
+        for (let r = 0; r < GRID_ROWS; r++) {
+            for (let c = 0; c < GRID_COLS; c++) {
+                if (this.grid[r][c]) result.push({ row: r, col: c, enemy: this.grid[r][c] });
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @param {number} row
+     * @param {number} col
+     * @returns {object|null}
+     */
+    getAt(row, col) {
+        if (row < 0 || row >= GRID_ROWS || col < 0 || col >= GRID_COLS) return null;
+        return this.grid[row][col];
+    }
+
+    // -------------------------------------------------------------------------
+    //  Snapshot / restore
+    // -------------------------------------------------------------------------
+
+    toSnapshot() {
+        return {
+            grid: this.grid.map(row =>
+                row.map(cell => cell ? { ...cell } : null)
+            ),
+        };
+    }
+
+    fromSnapshot(snap) {
+        this.grid = snap.grid.map(row =>
+            row.map(cell => cell ? { ...cell } : null)
+        );
     }
 }
